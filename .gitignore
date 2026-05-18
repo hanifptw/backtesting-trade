@@ -1,0 +1,25 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/app/**/__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Environment variables
+backend/.env
+.env
+.env.local
+
+# Next.js
+frontend/.next/
+frontend/node_modules/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
