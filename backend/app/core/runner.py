@@ -145,6 +145,20 @@ def _serialize_indicators(strategy, index: pd.DatetimeIndex) -> list[dict]:
                     series.append({"time": times[i]})
                 else:
                     series.append({"time": times[i], "value": float(v)})
+
+            if line_name.startswith("REGIME_BG:"):
+                parts = line_name.split(":", 2)
+                color = parts[1] if len(parts) > 1 else "gray"
+                label = parts[2] if len(parts) > 2 else line_name
+                out.append({
+                    "name": label,
+                    "type": "regime_bg",
+                    "color": color,
+                    "overlay": True,
+                    "values": series,
+                })
+                continue
+
             out.append({
                 "name": line_name,
                 "overlay": not _is_oscillator(values),

@@ -15,6 +15,15 @@ def sma(values, period: int) -> np.ndarray:
     return np.array(pd.Series(values).rolling(int(period)).mean(), dtype=float)
 
 
+def ema(values, period: int) -> np.ndarray:
+    """Exponential moving average. span=period, adjust=False (TradingView-compatible)."""
+    period = int(period)
+    return np.array(
+        pd.Series(values).ewm(span=period, adjust=False, min_periods=period).mean(),
+        dtype=float,
+    )
+
+
 def rsi(values, period: int = 14) -> np.ndarray:
     """Relative Strength Index — Wilder's smoothing (RMA), TradingView-compatible.
 
@@ -103,6 +112,54 @@ def atr(high, low, close, period: int = 10, method: str = "rma") -> np.ndarray:
         raise ValueError("atr_method must be one of: rma, sma, ema")
 
     return np.array(values, dtype=float)
+
+
+def adx(high, low, close, period: int = 14) -> np.ndarray:
+    """Wilder's Average Directional Index (ADX). Returns shape (N,), 0-100 range.
+
+    Steps:
+        1. Directional movement: +DM, -DM from high/low deltas
+        2. True Range (same as ATR)
+        3. RMA-smooth all three with `period` (alpha = 1/period)
+        4. +DI = 100 * RMA(+DM) / RMA(TR), -DI = 100 * RMA(-DM) / RMA(TR)
+        5. DX = 100 * |+DI - -DI| / (+DI + -DI)
+        6. ADX = RMA(DX, period)
+    """
+    period = int(period)
+    high_s = pd.Series(high).astype(float)
+    low_s = pd.Series(low).astype(float)
+    close_s = pd.Series(close).astype(float)
+
+    up = high_s.diff()
+    down = -low_s.diff()
+    plus_dm = pd.Series(
+        np.where((up > down) & (up > 0), up.fillna(0.0), 0.0),
+        index=high_s.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down > up) & (down > 0), down.fillna(0.0), 0.0),
+        index=high_s.index,
+    )
+
+    prev_close = close_s.shift(1)
+    tr = pd.concat(
+        [high_s - low_s, (high_s - prev_close).abs(), (low_s - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    alpha = 1.0 / period
+    tr_rma = tr.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    plus_dm_rma = plus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    minus_dm_rma = minus_dm.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+
+    safe_tr = tr_rma.replace(0.0, np.nan)
+    plus_di = 100.0 * plus_dm_rma / safe_tr
+    minus_di = 100.0 * minus_dm_rma / safe_tr
+
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    adx_vals = dx.ewm(alpha=alpha, adjust=False, min_periods=period).mean()
+    return np.array(adx_vals, dtype=float)
 
 
 def supertrend(

@@ -16,6 +16,12 @@ Entry triggers purely on %K crossing the oversold/overbought thresholds.
 No D-confirmation, no ARMED waiting state — fires on the first bar where
 the cross is detected.
 
+HTF filter (optional, default ON, backtest-only extension — not in STRATEGY.md):
+    Supertrend 4h gating — LONG only when 4h direction is bullish (+1),
+    SHORT only when bearish (-1). Affects new entries (and auto-reverse
+    flips) only; positions already open are not force-closed when the HTF
+    flips against them — they exit normally via SL / TP / trailing.
+
 Sizing (STRATEGY.md §5):
     notional = trade_amount × leverage
     Caller (runner.py) sets `margin = 1 / leverage` on the Backtest.
@@ -29,9 +35,15 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pandas as pd
 from backtesting import Strategy
+from backtesting.lib import OHLCV_AGG
 
-from app.core.indicators import stoch_d_line, stoch_k_line
+from app.core.indicators import (
+    stoch_d_line,
+    stoch_k_line,
+    supertrend,
+)
 
 
 # State machine states
@@ -78,6 +90,12 @@ class StochStateMachine(Strategy):
     auto_reverse_enabled: bool = False
     auto_reverse_max: int = 1
 
+    # Higher-timeframe filter — Supertrend 4h gates entries against HTF trend.
+    supertrend_filter_enabled: bool = True
+    st_atr_period: int = 10
+    st_multiplier: float = 3.0
+    st_method: str = "rma"
+
     def init(self):
         self._k = self.I(
             stoch_k_line,
@@ -91,6 +109,53 @@ class StochStateMachine(Strategy):
             self.rsi_period, self.stoch_k, self.stoch_smooth, self.stoch_d,
             name=f"%D({self.stoch_d})",
         )
+
+        # Higher-timeframe Supertrend 4h. Registered only when filter is enabled.
+        # We resample manually so each indicator value is a contiguous, writable
+        # numpy array — `FractionalBacktest` rescales overlay indicators in-place
+        # and chokes on the read-only buffers `resample_apply` hands back from
+        # `pd.Series.reindex` under copy-on-write.
+        # - `_st_4h_dir` (plot=False) drives the entry gate.
+        # - `Bullish` / `Bearish` lines (overlay=True) render the green/red
+        #   colored Supertrend on the main price chart (PriceChart.tsx picks
+        #   them up by name to draw the tinted fill against close).
+        self._st_4h_dir = None
+        if self.supertrend_filter_enabled:
+            df_main = self.data.df
+            # `label='right'` shifts each 4h bucket's timestamp to its close —
+            # combined with the union/ffill reindex below this is what prevents
+            # the strategy from seeing an in-progress 4h bar on the main TF.
+            df_4h = (
+                df_main.resample("4h", label="right", closed="right")
+                .agg(OHLCV_AGG)
+                .dropna()
+            )
+            st_4h = supertrend(
+                df_4h["High"], df_4h["Low"], df_4h["Close"],
+                self.st_atr_period, self.st_multiplier, self.st_method,
+            )
+            line_4h = st_4h[0]
+            dir_4h = st_4h[1]
+            bull_4h = np.where(dir_4h > 0, line_4h, np.nan)
+            bear_4h = np.where(dir_4h < 0, line_4h, np.nan)
+
+            def _align(arr_4h: np.ndarray) -> np.ndarray:
+                s = pd.Series(arr_4h, index=df_4h.index)
+                aligned = (
+                    s.reindex(df_main.index.union(df_4h.index), method="ffill")
+                    .reindex(df_main.index)
+                )
+                # `.copy()` guarantees writability; FractionalBacktest mutates it.
+                return np.ascontiguousarray(aligned.to_numpy(dtype=float, copy=True))
+
+            dir_aligned = _align(dir_4h)
+            bull_aligned = _align(bull_4h)
+            bear_aligned = _align(bear_4h)
+
+            label = f"Supertrend 4h({self.st_atr_period}, {self.st_multiplier:g})"
+            self._st_4h_dir = self.I(lambda a=dir_aligned: a, name="ST_4h_dir", plot=False)
+            self.I(lambda a=bull_aligned: a, name=f"{label} Bullish", overlay=True)
+            self.I(lambda a=bear_aligned: a, name=f"{label} Bearish", overlay=True)
 
         # State machine
         self._state: str = IDLE
@@ -117,10 +182,13 @@ class StochStateMachine(Strategy):
         self._reconcile_closed_trades()
 
         # 2) If a reverse is pending (SL hit on previous bar), open opposite side now.
+        #    HTF filter still gates the flip — if 4h trend disagrees, the reverse
+        #    is dropped and we wait for the next fresh cross.
         if self._pending_reverse_side is not None:
             side = self._pending_reverse_side
             self._pending_reverse_side = None
-            self._open_position(side, bypass_side_toggle=True)
+            if self._st_4h_allows(side):
+                self._open_position(side, bypass_side_toggle=True)
             return
 
         # 3) Trailing stop update for any active position.
@@ -133,14 +201,27 @@ class StochStateMachine(Strategy):
             cross_up_os = k_prev < self.oversold_level <= k_now
             cross_down_ob = k_prev > self.overbought_level >= k_now
 
-            if cross_up_os and self.long_enabled:
+            if cross_up_os and self.long_enabled and self._st_4h_allows("LONG"):
                 self._open_position("LONG")
                 self._state = IN_LONG
-            elif cross_down_ob and self.short_enabled:
+            elif cross_down_ob and self.short_enabled and self._st_4h_allows("SHORT"):
                 self._open_position("SHORT")
                 self._state = IN_SHORT
 
     # ------------------------------------------------------------------ helpers
+
+    def _st_4h_allows(self, side: str) -> bool:
+        """HTF gate: True if filter is off, or 4h Supertrend agrees with `side`.
+
+        During the 4h warm-up the direction is NaN — we block entries in that
+        window so we never open a trade against an unknown HTF trend.
+        """
+        if not self.supertrend_filter_enabled or self._st_4h_dir is None:
+            return True
+        val = float(self._st_4h_dir[-1])
+        if math.isnan(val):
+            return False
+        return (side == "LONG" and val > 0.0) or (side == "SHORT" and val < 0.0)
 
     def _open_position(self, side: str, *, bypass_side_toggle: bool = False) -> None:
         """Open LONG or SHORT with sizing & SL/TP per STRATEGY.md §5 & §6.
@@ -292,4 +373,19 @@ SCHEMA = {
     # Auto-reverse
     "auto_reverse_enabled": {"type": "bool", "default": False, "label": "Auto-reverse on SL", "group": "Auto-reverse"},
     "auto_reverse_max": {"type": "int", "default": 1, "min": 0, "max": 10, "label": "Max consecutive reverses", "group": "Auto-reverse"},
+    # Higher-timeframe filter (Supertrend 4h)
+    "supertrend_filter_enabled": {"type": "bool", "default": True, "label": "Enable Supertrend 4h filter", "group": "HTF Filter"},
+    "st_atr_period": {"type": "int", "default": 10, "min": 1, "max": 100, "label": "ST ATR period", "group": "HTF Filter"},
+    "st_multiplier": {"type": "float", "default": 3.0, "min": 0.5, "max": 10.0, "label": "ST multiplier", "group": "HTF Filter"},
+    "st_method": {
+        "type": "select",
+        "default": "rma",
+        "label": "ST ATR method",
+        "group": "HTF Filter",
+        "options": [
+            {"value": "rma", "label": "Wilder/RMA"},
+            {"value": "sma", "label": "SMA"},
+            {"value": "ema", "label": "EMA"},
+        ],
+    },
 }
